@@ -44,7 +44,7 @@ def accumulate(flat, idx, vals):
 
 
 def build(input_path, name, delta, out_dir, train_frac=0.60, val_frac=0.15,
-          forecast_horizon_hours=24):
+          split_strategy="chronological", split_seed=42):
     path = Path(input_path)
     names, d = read_layout(path)
 
@@ -97,44 +97,25 @@ def build(input_path, name, delta, out_dir, train_frac=0.60, val_frac=0.15,
     gap = np.zeros((n_total, T), dtype=np.float32)
     gap[:n_users] = (gap_sum / np.maximum(gap_n, 1)).reshape(n_users, T)
 
-    # Forecast labels: at each window end, mark bans in the following horizon.
-    # Window features contain events strictly before the cutoff; target events are
-    # in [cutoff, cutoff + horizon). Origins without complete outcome coverage are
-    # masked so the dataset tail is not mislabeled as negative.
-    horizon = float(forecast_horizon_hours) * 3600.0
-    if horizon <= 0:
-        raise ValueError("forecast_horizon_hours must be positive")
-    cutoffs = tmin + (np.arange(T, dtype=np.float64) + 1) * delta
-    complete = cutoffs + horizon <= tmax
-    ban_rows = np.flatnonzero(lab == 1)
-    ban_users, ban_ts = u[ban_rows], ts[ban_rows]
+    # Snapshot anomaly labels: a user is positive in the window containing a
+    # state_label==1 post. Features and labels describe the same completed window.
     y = np.zeros((n_total, T), dtype=np.uint8)
-    banned_by_cutoff = np.zeros((n_users, T), dtype=np.uint8)
-    for t, cutoff in enumerate(cutoffs):
-        prior = ban_ts < cutoff
-        banned_by_cutoff[np.unique(ban_users[prior]), t] = 1
-        future = (ban_ts >= cutoff) & (ban_ts < cutoff + horizon)
-        y[np.unique(ban_users[future]), t] = 1
-    y[:, ~complete] = 0
-    y[n_users:] = 0
-    user_ever = (np.bincount(ban_users, minlength=n_users) > 0).astype(np.uint8)
+    y[u[lab == 1], w[lab == 1]] = 1
+    user_ever = (np.bincount(u[lab == 1], minlength=n_users) > 0).astype(np.uint8)
 
     # ---- splits (time-ordered) ---------------------------------------------------------
     n_train = max(1, int(train_frac * T)); n_val = max(1, int(val_frac * T))
-    split = {"train": list(range(n_train)),
-             "validation": list(range(n_train, min(T, n_train + n_val))),
-             "test": list(range(min(T, n_train + n_val), T))}
-    # Purge origins whose forecast outcomes would cross into the next partition.
-    val_start = split["validation"][0] if split["validation"] else T
-    test_start = split["test"][0] if split["test"] else T
-    split["train"] = [t for t in split["train"] if cutoffs[t] + horizon <= cutoffs[min(val_start, T - 1)]]
-    split["validation"] = [t for t in split["validation"]
-                           if cutoffs[t] + horizon <= cutoffs[min(test_start, T - 1)]]
-    split["train"] = [t for t in split["train"] if complete[t]]
-    split["validation"] = [t for t in split["validation"] if complete[t]]
-    split["test"] = [t for t in split["test"] if complete[t]]
-    y[:n_users] *= active[:n_users].astype(np.uint8)
-    y[:n_users] *= (1 - banned_by_cutoff)
+    if split_strategy == "chronological":
+        split = {"train": list(range(n_train)),
+                 "validation": list(range(n_train, min(T, n_train + n_val))),
+                 "test": list(range(min(T, n_train + n_val), T))}
+    elif split_strategy == "random":
+        order = np.random.default_rng(split_seed).permutation(T).tolist()
+        split = {"train": order[:n_train],
+                 "validation": order[n_train:n_train + n_val],
+                 "test": order[n_train + n_val:]}
+    else:
+        raise ValueError("split_strategy must be 'chronological' or 'random'")
 
     # ---- node features: raw d + 3 static per-window statistics, z-scored on TRAIN rows -
     X = np.zeros((T, n_total, d + N_EXTRA), dtype=np.float32)
@@ -155,27 +136,29 @@ def build(input_path, name, delta, out_dir, train_frac=0.60, val_frac=0.15,
         snapshots.append({"edge_index": np.vstack([src, dst]).astype(np.int64), "edge_weight": wt, "x": X[s].copy()})
         print(f"window {s}: active={int(on.sum())} directed edges={len(src)} positives={int(y[:, s].sum())}")
 
-    # Context candidates are selected using train-period activity only. At each
-    # scoring cutoff, users already banned are filtered out using past events only.
-    pool = np.flatnonzero(active[:n_users, :n_train].sum(axis=1) >= 3)
+    # Select context candidates using training labels only. They may later become
+    # anomalous, so test-label information is not needed for context selection.
+    train_anomalous = y[:n_users, split["train"]].max(axis=1).astype(bool)
+    pool = np.flatnonzero((~train_anomalous) & (active[:n_users, split["train"]].sum(axis=1) >= 3))
     contexts = {}
     for seed in range(5):
         rng = np.random.default_rng(SEED + seed)
         contexts[str(seed)] = rng.choice(pool, size=min(N_CONTEXT, len(pool)), replace=False).astype(np.int64)
 
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    file = out / f"{name}_delta{delta}_windowed.npz"
+    split_tag = "" if split_strategy == "chronological" else f"_random_split_seed{split_seed}"
+    file = out / f"{name}_delta{delta}_windowed{split_tag}.npz"
     np.savez_compressed(file,
         node_type=np.r_[np.zeros(n_users, np.uint8), np.ones(n_items, np.uint8)],
         snapshots=np.asarray(snapshots, dtype=object), y=y, active_mask=active,
-        user_ever_anomalous=user_ever, banned_by_cutoff=banned_by_cutoff,
-        forecast_complete=complete, forecast_cutoff_timestamp=cutoffs,
+        user_ever_anomalous=user_ever,
         split=json.dumps(split), context_pool=pool,
         context_samples=np.asarray(contexts, dtype=object),
         config=json.dumps({"name": name, "delta": delta, "seed": SEED, "n_context": N_CONTEXT,
                            "n_extra": N_EXTRA, "input": str(path),
-                           "forecast_horizon_hours": forecast_horizon_hours,
-                           "label_definition": "ban event in [window_end, window_end + horizon)"}),
+                           "label_definition": "state_label==1 event in the same snapshot window",
+                           "split_strategy": split_strategy, "split_seed": split_seed,
+                           "evaluation_task": "window-level anomaly detection"}),
         feature_scaler_mean=mean, feature_scaler_std=std)
     print(f"saved {file}: nodes={n_total} windows={T} context pool={len(pool)}")
     return file
@@ -186,8 +169,9 @@ if __name__ == "__main__":
     ap.add_argument("--input", default="reddit_dataset/reddit.csv")
     ap.add_argument("--name", default="reddit")
     ap.add_argument("--delta", type=int, default=86400)
-    ap.add_argument("--forecast-horizon-hours", type=float, default=24,
-                    help="future interval for ban prediction labels (default: 24 hours)")
+    ap.add_argument("--split-strategy", choices=("chronological", "random"), default="chronological")
+    ap.add_argument("--split-seed", type=int, default=42)
     ap.add_argument("--out-dir", default="reddit_dyn")
     a = ap.parse_args()
-    build(a.input, a.name, a.delta, a.out_dir, forecast_horizon_hours=a.forecast_horizon_hours)
+    build(a.input, a.name, a.delta, a.out_dir,
+          split_strategy=a.split_strategy, split_seed=a.split_seed)

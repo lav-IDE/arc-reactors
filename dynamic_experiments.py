@@ -65,9 +65,9 @@ class Bank:
         return self.cache[(t, history)]
 
 
-def resolve_forecast_context(ids, t, ds, size, seed):
-    """Use only users active and not banned as of the context cutoff."""
-    eligible = ds.active[:ds.n_users, t] & ~ds.banned_by_cutoff[:, t].astype(bool)
+def resolve_window_context(ids, t, ds, size, seed):
+    """Use sampled training-normal contexts that are active in this snapshot."""
+    eligible = ds.active[:ds.n_users, t]
     ids = np.asarray(ids, dtype=np.int64)
     ids = ids[eligible[ids]]
     if len(ids) < size:
@@ -90,15 +90,15 @@ def run_protocol(model, bank, ds, windows, samples, history, lag=0, fixed_ctx=No
         ev = Eval()
         for t in windows:
             ct = fixed_ctx if fixed_ctx is not None else max(0, t - lag)
-            ctx = resolve_forecast_context(ids, ct, ds, len(ids), 2026 + int(sid) * 100 + ct)
+            ctx = resolve_window_context(ids, ct, ds, len(ids), 2026 + int(sid) * 100 + ct)
             held = np.array([], np.int64)
             if hold:
-                risk = ds.active[:ds.n_users, t] & ~ds.banned_by_cutoff[:, t].astype(bool)
+                risk = ds.active[:ds.n_users, t]
                 anom = np.setdiff1d(np.flatnonzero(risk & (ds.y[:ds.n_users, t] == 1)), ctx)
                 held = np.random.default_rng(994 + int(sid) * 100 + t).permutation(anom)[:hold]
             if contam and len(held):
                 k = min(contam, len(held)); ctx = np.r_[ctx[:len(ctx) - k], held[:k]]
-            risk = ds.active[:ds.n_users, t] & ~ds.banned_by_cutoff[:, t].astype(bool)
+            risk = ds.active[:ds.n_users, t]
             q = np.setdiff1d(np.flatnonzero(risk), np.r_[ctx, held])
             if not len(ctx) or not len(q): continue
             tq = bank.traj(t, history); tc = tq if ct == t else bank.traj(ct, history)
@@ -112,8 +112,7 @@ def train_temporal(src, sbank, mode, seed, args):
     """Train on source train windows; keep the epoch with best source-validation AUPRC."""
     dev = args.device
     smooth_tag = "u" if args.no_smooth else "s"
-    horizon_tag = f"fh{src.config.get('forecast_horizon_hours', 'legacy'):g}" if isinstance(src.config.get("forecast_horizon_hours"), (int, float)) else "fhlegacy"
-    ck = Path(args.work_dir) / f"dyn_{src.stem}__{horizon_tag}_{mode}_s{seed}_ep{args.epochs}_h{args.history}_{smooth_tag}.pt"
+    ck = Path(args.work_dir) / f"dyn_{src.stem}__window_{mode}_s{seed}_ep{args.epochs}_h{args.history}_{smooth_tag}.pt"
     set_seed(seed); model = DynamicARC(sbank.x.shape[-1], mode).to(dev)
     if ck.exists():
         model.load_state_dict(torch.load(ck, map_location=dev, weights_only=True)); return model.eval()
@@ -123,7 +122,7 @@ def train_temporal(src, sbank, mode, seed, args):
     for epoch in range(args.epochs):
         model.train(); order = list(src.split["train"]); np.random.shuffle(order); losses = []
         for t in order:
-            risk = src.active[:src.n_users, t] & ~src.banned_by_cutoff[:, t].astype(bool)
+            risk = src.active[:src.n_users, t]
             cand = src.pool[risk[src.pool]]
             if len(cand) < 10: continue
             elig = np.zeros(src.active.shape[0], dtype=bool); elig[:src.n_users] = risk
@@ -169,10 +168,10 @@ def main():
         banks[ds.stem] = Bank(np.load(f), args.device)
     sbank, tbank = banks[src.stem], banks[tgt.stem]
 
-    if src.config.get("forecast_horizon_hours") != tgt.config.get("forecast_horizon_hours"):
-        raise ValueError("Source and target archives must use the same forecast horizon")
+    if src.config.get("label_definition") != tgt.config.get("label_definition"):
+        raise ValueError("Source and target archives must use the same label definition")
     results = {"source": src.path, "target": tgt.path, "history": args.history, "epochs": args.epochs,
-               "forecast_horizon_hours": tgt.config.get("forecast_horizon_hours"),
+               "task": tgt.config.get("evaluation_task", "snapshot anomaly detection"),
                "seeds": args.seeds, "sort_smooth": not args.no_smooth, "variants": {}}
     models = {}
     for mode in args.modes:
@@ -199,8 +198,7 @@ def main():
     # contaminated context (query population held fixed across levels)
     results["context_contamination"] = {str(k): sweep(contam=k, hold=5) for k in (0, 1, 2, 5)}
     tag = f"{src.stem}_to_{tgt.stem}" if args.source else tgt.stem
-    horizon_tag = f"fh{tgt.config.get('forecast_horizon_hours', 'legacy')}h"
-    out = Path(args.work_dir) / f"dynamic_results_{tag}_{horizon_tag}_{sm}.json"
+    out = Path(args.work_dir) / f"dynamic_results_{tag}_window_{sm}.json"
     out.write_text(json.dumps(results, indent=2), encoding="utf-8"); print("saved", out)
 
 

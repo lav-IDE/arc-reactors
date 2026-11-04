@@ -13,11 +13,7 @@ def run(path):
     z = np.load(path, allow_pickle=True); snaps = z["snapshots"]; y, act = z["y"], z["active_mask"]
     ever, pool = z["user_ever_anomalous"], z["context_pool"]; split = json.loads(str(z["split"].item()))
     n_users = int((z["node_type"] == 0).sum()); T = len(snaps)
-    banned = z["banned_by_cutoff"] if "banned_by_cutoff" in z else np.zeros((n_users, T), dtype=bool)
-    complete = z["forecast_complete"] if "forecast_complete" in z else np.ones(T, dtype=bool)
     assert not y[n_users:].any() and np.all(y[~act] == 0), "labels only on active users"
-    assert not y[:, ~complete].any(), "incomplete forecast origins must not carry labels"
-    assert not np.any((banned.astype(bool)) & (y[:n_users] > 0)), "already-banned users must be outside the risk set"
     for t, s in enumerate(snaps):
         ei = s["edge_index"]
         assert np.isfinite(s["x"]).all() and np.all(s["x"][~act[:, t]] == 0), f"window {t}: bad/inactive features"
@@ -35,8 +31,8 @@ def run(path):
     prior = np.array([act[u, :ban[u]].sum() for u in users])
     print(f"ever-banned users: {len(users)}; context candidate pool: {len(pool)}")
     if len(users):
-        print(f"ever-banned users with >=3 active windows before first positive forecast: {100*np.mean(prior >= 3):.1f}%")
-    print(f"forecast-complete origins: {int(complete.sum())}/{T}; positives per origin: {pos_per_window.tolist()}")
+        print(f"ever-banned users with >=3 active windows before anomaly window: {100*np.mean(prior >= 3):.1f}%")
+    print(f"anomalous users per window: {pos_per_window.tolist()}")
     out = Path(path).parent
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     ax[0].bar(range(T), edges); ax[0].set(xlabel="window", ylabel="directed edges", title="Edges per snapshot")

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from arc_common import (Archive, Eval, TrainOnlyAligner, arc_config, prepare_graph, resolve_context,
+from arc_common import (Archive, Eval, TrainOnlyAligner, arc_config, prepare_graph,
                         set_seed, summarize, train_arc)
 from model import ARC
 
@@ -50,26 +50,34 @@ def main():
                 net.train(); loss = net.cross_attn.get_train_loss(net(g), g.ano_labels, cfg["num_prompt"])
                 opt.zero_grad(); loss.backward(); opt.step()
             net.eval()
-        ev = Eval()
         with torch.no_grad():
-            for t in ds.split["test"]:
-                emb = net(test_graphs[t].to(a.device))
-                risk = ds.active[:ds.n_users, t] & ~ds.banned_by_cutoff[:, t].astype(bool)
-                ids = ds.samples[str(seed)]
-                ctx = ids[risk[ids]]
-                if len(ctx) < len(ids):
-                    avail = ds.pool[risk[ds.pool] & ~np.isin(ds.pool, ctx)]
-                    take = min(len(ids) - len(ctx), len(avail))
-                    if take:
-                        ctx = np.r_[ctx, np.random.default_rng(2026 + seed * 100 + t).choice(avail, take, replace=False)]
-                q = np.setdiff1d(np.flatnonzero(risk), ctx)
-                if not len(ctx) or not len(q): continue
-                qt = torch.as_tensor(q, device=a.device); ct = torch.as_tensor(ctx, device=a.device)
-                rec = net.cross_attn.cross_attention(emb[qt], emb[ct])           # == ARC get_test_score
-                ev.add(ds.y[q, t], torch.linalg.vector_norm(emb[qt] - rec, dim=1).cpu().numpy(), t)
-        runs.append(ev.result()); print(f"seed={seed}", runs[-1], flush=True)
-    res = {"method": a.training_setup, "archive": a.archive, "epochs": a.epochs, "trials": a.trials, **summarize(runs), "runs": runs}
-    out = out_dir / ("static_arc_results.json" if a.training_setup == "arc-multidomain" else "static_union_results.json")
+            for sid, sample_ids in ds.samples.items():
+                ev = Eval()
+                for t in ds.split["test"]:
+                    emb = net(test_graphs[t].to(a.device))
+                    risk = ds.active[:ds.n_users, t]
+                    ids = np.asarray(sample_ids, dtype=np.int64)
+                    ctx = ids[risk[ids]]
+                    if len(ctx) < len(ids):
+                        avail = ds.pool[risk[ds.pool] & ~np.isin(ds.pool, ctx)]
+                        take = min(len(ids) - len(ctx), len(avail))
+                        if take:
+                            ctx = np.r_[ctx, np.random.default_rng(2026 + int(sid) * 100 + t).choice(avail, take, replace=False)]
+                    q = np.setdiff1d(np.flatnonzero(risk), ctx)
+                    if not len(ctx) or not len(q): continue
+                    qt = torch.as_tensor(q, device=a.device); ct = torch.as_tensor(ctx, device=a.device)
+                    rec = net.cross_attn.cross_attention(emb[qt], emb[ct])       # ARC's original in-context scorer
+                    ev.add(ds.y[q, t], torch.linalg.vector_norm(emb[qt] - rec, dim=1).cpu().numpy(), t)
+                runs.append(ev.result())
+        print(f"model_seed={seed} completed {len(ds.samples)} context evaluations", flush=True)
+    res = {"method": a.training_setup, "archive": a.archive,
+           "task": ds.config.get("evaluation_task", "snapshot anomaly detection"),
+           "epochs": a.epochs, "trials": a.trials,
+           "contexts_per_trial": len(ds.samples),
+           "evaluation": "same-window anomaly detection on test snapshots and active users",
+           **summarize(runs), "runs": runs}
+    split_tag = "window" if ds.config.get("split_strategy", "chronological") == "chronological" else f"window_random_seed{ds.config.get('split_seed', 42)}"
+    out = out_dir / f"static_{a.training_setup.replace('-', '_')}_results_{split_tag}.json"
     out.write_text(json.dumps(res, indent=2), encoding="utf-8"); print("saved", out)
 
 

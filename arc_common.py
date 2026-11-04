@@ -42,8 +42,6 @@ class Archive:
         with np.load(path, allow_pickle=True) as z:
             self.snapshots = list(z["snapshots"]); self.y = z["y"]; self.active = z["active_mask"]
             self.anomalous = np.flatnonzero(z["user_ever_anomalous"]); self.pool = z["context_pool"]
-            self.banned_by_cutoff = z["banned_by_cutoff"] if "banned_by_cutoff" in z else np.zeros_like(self.y[:int((z["node_type"] == 0).sum())])
-            self.forecast_complete = z["forecast_complete"] if "forecast_complete" in z else np.ones(self.y.shape[1], dtype=bool)
             self.samples = z["context_samples"].item(); self.split = json.loads(str(z["split"].item()))
             self.node_type = z["node_type"]
             self.config = json.loads(str(z["config"].item())) if "config" in z else {}
